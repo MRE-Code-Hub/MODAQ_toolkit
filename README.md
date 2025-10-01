@@ -23,7 +23,7 @@ CSV and easier to work with than raw MODAQ output.
 ### Quick install from GitHub:
 
 ```bash
-pip install git+https://github.nrel.gov/Water-Power/modaq_toolkit.git
+pip install git+https://github.com/NREL-MODAQ2/MODAQ_toolkit.git
 ```
 
 For detailed installation options including conda environments, specific versions, and development setup, see the [Installation section](#installation) below.
