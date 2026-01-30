@@ -72,11 +72,13 @@ class MCAPParser:
         1.0  # Threshold for timing misalignment warnings
     )
 
-    def __init__(self, mcap_path: Path):
+    def __init__(self, mcap_path: Path, topics_to_skip: list[str] | None = None):
         self.mcap_path = mcap_path
         self.processors: dict[str, MessageProcessor] = {}
         self.schemas_by_topic: dict[str, dict] = {}
         self.dataframes: dict[str, pd.DataFrame] = {}
+        self.topics_to_skip = topics_to_skip if topics_to_skip else []
+        self._processed = False  # Track whether read_mcap() has been called
 
     def _process_channel(self, channel, schema, summary) -> None:
         """Process a single channel from the MCAP file."""
@@ -123,33 +125,86 @@ class MCAPParser:
 
             # Create dataframes
             for topic, processor in self.processors.items():
-                self.dataframes[topic] = processor.get_dataframe()
-                logger.debug(
-                    f"Topic {topic} DataFrame shape: {self.dataframes[topic].shape}"
-                )
+                if topic not in self.topics_to_skip:
+                    self.dataframes[topic] = processor.get_dataframe()
+                    logger.info(
+                        f"Topic {topic} DataFrame shape: {self.dataframes[topic].shape}"
+                    )
+
+        # Mark as processed
+        self._processed = True
 
     def _process_dataframe_for_stage2(
-        self, df: pd.DataFrame
+        self,
+        df: pd.DataFrame,
+        convert_ros_time_to_utc_datetime_index: bool = True,
+        remove_original_extra_time_columns: bool = False,
     ) -> tuple[pd.DataFrame, float]:
         """Process a dataframe for stage 2, returning the processed df and sample rate."""
+        # Early exit for empty DataFrame
+        if df.empty:
+            return df, None
+
         object_columns = [col for col in df.columns if is_array_column(df[col])]
 
         if object_columns:
             logger.debug("Found arrays, expanding for a2 processing")
             df = expand_array_columns_vertically(df)
-            df["time"] = pd.to_datetime(
-                df["system_time"], origin="unix", unit="ns", utc=True
-            )
-            df = df.set_index("time")
-            df = df.drop(["sec", "nanosec", "frame_id", "timestamp"], axis="columns")
 
-            time_diffs = df.index.to_series().diff().dt.total_seconds()
-            return df, 1 / time_diffs.mean()
+            # If all rows were skipped during expansion, return empty DataFrame
+            if df.empty:
+                return df, None
+
+            if convert_ros_time_to_utc_datetime_index:
+                # Create time index from available time columns
+                # Priority: system_time (high-res sensor data) > timestamp (header stamp)
+                if "system_time" in df.columns:
+                    df["time"] = pd.to_datetime(
+                        df["system_time"], origin="unix", unit="ns", utc=True
+                    )
+                    df = df.set_index("time")
+                    time_diffs = df.index.to_series().diff().dt.total_seconds()
+                    sample_rate = 1 / time_diffs.mean()
+                elif "timestamp" in df.columns:
+                    df["time"] = pd.to_datetime(
+                        df["timestamp"], origin="unix", unit="s", utc=True
+                    )
+                    df = df.set_index("time")
+                    time_diffs = df.index.to_series().diff().dt.total_seconds()
+                    sample_rate = 1 / time_diffs.mean()
+                else:
+                    logger.warning(
+                        f"No time column (system_time or timestamp) found after array expansion. "
+                        f"Skipping time indexing. Available columns: {df.columns.tolist()}"
+                    )
+                    sample_rate = None
+
+            if remove_original_extra_time_columns:
+                # Drop common time/header columns if they exist
+                cols_to_drop = [
+                    "sec",
+                    "nanosec",
+                    "frame_id",
+                    "timestamp",
+                    "system_time",
+                ]
+                existing_cols_to_drop = [
+                    col for col in cols_to_drop if col in df.columns
+                ]
+                if existing_cols_to_drop:
+                    df = df.drop(existing_cols_to_drop, axis="columns")
+
+            return df, sample_rate
         else:
-            df["time"] = pd.to_datetime(
-                df["timestamp"], origin="unix", unit="s", utc=True
-            )
-            df = df.set_index("time")
+            if "timestamp" not in df.columns:
+                logger.warning(
+                    f"No 'timestamp' column found for stage 2 processing on non-array data. Skipping inclusion of time index. Valid columns are {df.columns.tolist()}"
+                )
+            else:
+                df["time"] = pd.to_datetime(
+                    df["timestamp"], origin="unix", unit="s", utc=True
+                )
+                df = df.set_index("time")
             return df, None
 
     def _get_topic_timing(self, df: pd.DataFrame) -> TopicTiming:
@@ -229,16 +284,30 @@ class MCAPParser:
                 f"  Latest ending topics: {', '.join(latest_end_topics)} at {latest_end}"
             )
 
-    def get_dataframes(self, process_stage2: bool = False) -> dict[str, pd.DataFrame]:
+    def get_dataframes(
+        self,
+        process_stage2: bool = False,
+        stage_2_convert_ros_time_to_utc_datetime_index: bool = True,
+        stage_2_remove_original_extra_time_columns: bool = False,
+    ) -> dict[str, pd.DataFrame]:
         """
         Return a dictionary of processed dataframes without saving to disk.
 
+        Automatically calls read_mcap() if it hasn't been called yet.
+
         Args:
             process_stage2: If True, process dataframes for stage 2 (expand arrays, etc.)
+            stage_2_convert_ros_time_to_utc_datetime_index: If True, convert ROS time (sec,nanosec) to UTC datetime index
+            stage_2_remove_original_extra_time_columns: If True, remove sec, nanosec, timestamp, system_time
+            columns from original dataframes
 
         Returns:
             A dictionary with topic names as keys and processed dataframes as values
         """
+        # Auto-call read_mcap() if not yet processed
+        if not self._processed:
+            self.read_mcap()
+
         result = {}
 
         # Filter out empty dataframes
@@ -252,13 +321,36 @@ class MCAPParser:
 
         # Process for stage 2 (expand arrays, add time index, etc.)
         for topic, df in non_empty_topics.items():
-            processed_df, _ = self._process_dataframe_for_stage2(df.copy())
-            result[topic] = processed_df
+            logger.info(
+                f"Processing dataframe for topic: {topic} with shape {df.shape}"
+            )
+            processed_df, _ = self._process_dataframe_for_stage2(
+                df.copy(),
+                convert_ros_time_to_utc_datetime_index=stage_2_convert_ros_time_to_utc_datetime_index,
+                remove_original_extra_time_columns=stage_2_remove_original_extra_time_columns,
+            )
+            logger.info(f"  Stage 2 Processed DataFrame shape: {processed_df.shape}")
+
+            # Only include non-empty DataFrames in result
+            if not processed_df.empty:
+                result[topic] = processed_df
+            else:
+                logger.warning(
+                    f"Topic {topic} became empty after stage 2 processing, excluding from results"
+                )
 
         return result
 
     def create_output(self, output_dir: Path, stage: str = "a1_one_to_one") -> None:
-        """Create partitioned parquet files and metadata JSON for each topic."""
+        """
+        Create partitioned parquet files and metadata JSON for each topic.
+
+        Automatically calls read_mcap() if it hasn't been called yet.
+        """
+        # Auto-call read_mcap() if not yet processed
+        if not self._processed:
+            self.read_mcap()
+
         stage_dir = output_dir / stage
         metadata_dir = output_dir / "metadata"
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -456,7 +548,9 @@ def get_mcap_files(input_path: Path) -> list[tuple[Path, str]]:
 
 
 def process_mcap_and_get_dataframes(
-    mcap_file: Path, process_stage2: bool = False
+    mcap_file: Path,
+    process_stage2: bool = True,
+    topics_to_skip: list[str] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Process a single MCAP file and return the dataframes without saving to disk.
@@ -464,6 +558,7 @@ def process_mcap_and_get_dataframes(
     Args:
         mcap_file: Path to the MCAP file
         process_stage2: If True, process dataframes for stage 2 (expand arrays, etc.)
+        topics_to_skip: Optional list of topic names to skip during processing
 
     Returns:
         A dictionary with topic names as keys and processed dataframes as values
@@ -471,7 +566,7 @@ def process_mcap_and_get_dataframes(
 
     logger.info(f"Processing file {mcap_file.name} for in-memory access")
 
-    parser = MCAPParser(mcap_file)
+    parser = MCAPParser(mcap_file, topics_to_skip=topics_to_skip)
     parser.read_mcap()
 
     # Get dataframes with or without stage 2 processing
@@ -479,7 +574,10 @@ def process_mcap_and_get_dataframes(
 
 
 def process_mcap_dir_to_dataframes(
-    input_dir: Path, process_stage2: bool = True, concat_by_topic: bool = True
+    input_dir: Path,
+    process_stage2: bool = True,
+    concat_by_topic: bool = True,
+    topics_to_skip: list[str] | None = None,
 ) -> dict[str, dict[str, pd.DataFrame] | pd.DataFrame]:
     """
     Process all MCAP files in a directory and return them as a dictionary
@@ -490,6 +588,7 @@ def process_mcap_dir_to_dataframes(
         process_stage2: If True, process dataframes with stage 2 processing
         concat_by_topic: If True, concatenate all dataframes for each topic within a group
                         If False, return a dictionary of dataframes per topic
+        topics_to_skip: Optional list of topic names to skip during processing
 
     Returns:
         A dictionary where:
@@ -523,7 +622,9 @@ def process_mcap_dir_to_dataframes(
     # Process each file
     for mcap_file, group_name in mcap_files:
         # Get dataframes from current file
-        topic_dfs = process_mcap_and_get_dataframes(mcap_file, process_stage2)
+        topic_dfs = process_mcap_and_get_dataframes(
+            mcap_file, process_stage2, topics_to_skip=topics_to_skip
+        )
 
         # Skip if no dataframes were found
         if not topic_dfs:
@@ -570,25 +671,63 @@ def process_mcap_dir_to_dataframes(
     return result
 
 
-def process_single_file(mcap_file: Path, group: str, output_path: Path) -> None:
-    """Process a single MCAP file - this function runs in its own process."""
+def process_single_file(
+    mcap_file: Path,
+    group: str,
+    output_path: Path,
+    topics_to_skip: list[str] | None = None,
+    process_stage1: bool = True,
+    process_stage2: bool = True,
+    stage1_dir: str | Path = "a1_one_to_one",
+    stage2_dir: str | Path = "a2_unpacked",
+) -> None:
+    """
+    Process a single MCAP file - this function runs in its own process.
+
+    Args:
+        mcap_file: Path to the MCAP file to process
+        group: Group name for organizing output
+        output_path: Base output directory
+        topics_to_skip: Optional list of topic names to skip during processing
+        process_stage1: If True, process and save stage 1 output.
+                       Stage 1 preserves one-to-one ROS message structure where each row is
+                       a single ROS message. Array fields remain packed within rows.
+        process_stage2: If True, process and save stage 2 output.
+                       Stage 2 unpacks array fields into separate rows, where each array element
+                       becomes its own row. This format is recommended for analysis as it follows
+                       tidy data principles: each variable is a column, each observation is a row,
+                       and each value is a single cell.
+        stage1_dir: Directory name for stage 1 output (default: "a1_one_to_one")
+        stage2_dir: Directory name for stage 2 output (default: "a2_unpacked")
+    """
     logger.info(f"\nProcessing file {mcap_file.name} from group '{group}'")
+
+    # Convert to Path objects
+    stage1_path = Path(stage1_dir)
+    stage2_path = Path(stage2_dir)
 
     # Create group-specific output directories
     group_output = output_path / group
     group_metadata = group_output / "metadata"
-    (group_output / "a1_one_to_one").mkdir(parents=True, exist_ok=True)
-    (group_output / "a2_real_data").mkdir(parents=True, exist_ok=True)
+
+    if process_stage1:
+        (group_output / stage1_path).mkdir(parents=True, exist_ok=True)
+    if process_stage2:
+        (group_output / stage2_path).mkdir(parents=True, exist_ok=True)
+
     group_metadata.mkdir(parents=True, exist_ok=True)
 
-    parser = MCAPParser(mcap_file)
+    parser = MCAPParser(mcap_file, topics_to_skip=topics_to_skip)
     parser.read_mcap()
     original_dataframes = parser.dataframes.copy()
 
-    parser.create_output(group_output, stage="a1_one_to_one")
-    logger.info("Processing expanded arrays")
-    parser.dataframes = original_dataframes
-    parser.create_output(group_output, stage="a2_real_data")
+    if process_stage1:
+        parser.create_output(group_output, stage=str(stage1_path))
+
+    if process_stage2:
+        logger.info("Processing expanded arrays")
+        parser.dataframes = original_dataframes
+        parser.create_output(group_output, stage=str(stage2_path))
 
     logger.info(f"Completed processing {mcap_file.name}\n")
     return mcap_file.name
@@ -598,8 +737,25 @@ async def process_mcap_files_parallel(
     mcap_files: list[tuple[Path, str]],
     output_path: Path,
     max_workers: int | None = None,
+    topics_to_skip: list[str] | None = None,
+    process_stage1: bool = True,
+    process_stage2: bool = True,
+    stage1_dir: str | Path = "a1_one_to_one",
+    stage2_dir: str | Path = "a2_unpacked",
 ) -> None:
-    """Process MCAP files in parallel using ProcessPoolExecutor."""
+    """
+    Process MCAP files in parallel using ProcessPoolExecutor.
+
+    Args:
+        mcap_files: List of (file_path, group) tuples to process
+        output_path: Base output directory
+        max_workers: Number of parallel workers (default: CPU count - 1)
+        topics_to_skip: Optional list of topic names to skip during processing
+        process_stage1: If True, process and save stage 1 (one-to-one ROS message) output
+        process_stage2: If True, process and save stage 2 (unpacked arrays) output
+        stage1_dir: Directory name for stage 1 output (default: "a1_one_to_one")
+        stage2_dir: Directory name for stage 2 output (default: "a2_unpacked")
+    """
     if max_workers is None:
         # Use CPU count - 1 to leave one core free for system tasks
         max_workers = max(1, multiprocessing.cpu_count() - 1)
@@ -611,7 +767,16 @@ async def process_mcap_files_parallel(
         # Create tasks for all files
         futures = [
             loop.run_in_executor(
-                pool, process_single_file, mcap_file, group, output_path
+                pool,
+                process_single_file,
+                mcap_file,
+                group,
+                output_path,
+                topics_to_skip,
+                process_stage1,
+                process_stage2,
+                stage1_dir,
+                stage2_dir,
             )
             for mcap_file, group in mcap_files
         ]
@@ -627,15 +792,33 @@ async def process_mcap_files_parallel(
 
 
 def process_mcap_files(
-    input_dir: str, output_dir: str, async_processing: bool = False
+    input_dir: str,
+    output_dir: str,
+    async_processing: bool = False,
+    topics_to_skip: list[str] | None = None,
+    process_stage1: bool = True,
+    process_stage2: bool = True,
+    stage1_dir: str | Path = "a1_one_to_one",
+    stage2_dir: str | Path = "a2_unpacked",
 ) -> None:
     """
-    Process all MCAP files in a directory and its subdirectories with single read and dual output.
+    Process all MCAP files in a directory and its subdirectories
 
     Args:
         input_dir: Input directory containing MCAP files
         output_dir: Output directory for processed files
         async_processing: If True, process files in parallel using multiple CPU cores
+        topics_to_skip: Optional list of topic names to skip during processing
+        process_stage1: If True, process and save stage 1 output.
+                       Stage 1 preserves one-to-one ROS message structure where each row is
+                       a single ROS message. Array fields remain packed within rows.
+        process_stage2: If True, process and save stage 2 output.
+                       Stage 2 unpacks array fields into separate rows, where each array element
+                       becomes its own row. This format is recommended for analysis as it follows
+                       tidy data principles: each variable is a column, each observation is a row,
+                       and each value is a single cell.
+        stage1_dir: Directory name for stage 1 output (default: "a1_one_to_one")
+        stage2_dir: Directory name for stage 2 output (default: "a2_unpacked")
     """
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -655,7 +838,17 @@ def process_mcap_files(
 
     if async_processing:
         try:
-            asyncio.run(process_mcap_files_parallel(mcap_files, output_path))
+            asyncio.run(
+                process_mcap_files_parallel(
+                    mcap_files,
+                    output_path,
+                    topics_to_skip=topics_to_skip,
+                    process_stage1=process_stage1,
+                    process_stage2=process_stage2,
+                    stage1_dir=stage1_dir,
+                    stage2_dir=stage2_dir,
+                )
+            )
         except KeyboardInterrupt:
             logger.warning("\nProcessing interrupted by user")
             return
@@ -663,7 +856,16 @@ def process_mcap_files(
         # Sequential processing
         for mcap_file, group in mcap_files:
             try:
-                process_single_file(mcap_file, group, output_path)
+                process_single_file(
+                    mcap_file,
+                    group,
+                    output_path,
+                    topics_to_skip=topics_to_skip,
+                    process_stage1=process_stage1,
+                    process_stage2=process_stage2,
+                    stage1_dir=stage1_dir,
+                    stage2_dir=stage2_dir,
+                )
             except KeyboardInterrupt:
                 logger.warning("\nProcessing interrupted by user")
                 return
